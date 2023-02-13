@@ -1,0 +1,78 @@
+on: 
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+
+name: checks
+
+jobs:
+  checks:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: Rscript {0}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+          r-version: '4.2.1'
+      - uses: r-lib/actions/setup-pandoc@v2
+      - uses: r-lib/actions/setup-tinytex@v2
+      - name: Get deps for getsysreqs
+        shell: bash {0}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev
+      - name: Get sys reqs for renv packages
+        shell: bash {0}
+        run: |
+          R -e 'install.packages("remotes")'
+          R -e 'remotes::install_github("mdneuzerling/getsysreqs", force=TRUE)'
+          REQS=$(Rscript -e 'options(warn = -1); cat(getsysreqs::get_sysreqs("renv.lock"))' \
+          | sed s/"WARNING: ignoring environment value of R_HOME"//) \
+          && echo $REQS && sudo apt-get install -y $REQS
+      - uses: r-lib/actions/setup-renv@v2
+      - name: Lint and run .R and .Rmd files
+        run: |
+          # Discover all .R files and exclude those in renv/library
+          Rfiles <- list.files(pattern = "\\.R$|\\.r$", recursive = TRUE, full.names = TRUE)
+          Rfiles <- Rfiles[!grepl("renv/", Rfiles)]
+
+          # Discover all .Rmd files and exclude those in renv/library
+          Rmdfiles <- list.files(pattern = "\\.Rmd$", recursive = TRUE, full.names = TRUE)
+          Rmdfiles <- Rmdfiles[!grepl("renv/", Rmdfiles)]
+
+          # Run all .R files and print errors, AND stop if any errors
+          lapply(Rfiles, source)
+
+          # Render all .Rmd files and print errors, AND stop if any errors
+          lapply(Rmdfiles, rmarkdown::render)
+
+          # Concatenate all .Rmd and .R filenames
+          files <- c(Rfiles, Rmdfiles)
+
+          # Lint all files
+          errors <- lapply(files, lintr::lint)
+
+          # Find all linting errors
+          lens <- sapply(errors, length)
+          to_print <- errors[lens > 0]
+
+          # If there are any errors, stop the workflow and print them
+          if (any(lens > 0)) {
+            for (i in seq_along(to_print)) {
+              print(to_print[[i]])
+            }
+            warning("Linting failed. See log details for more info.")
+            
+          }
+          
+          
+  
