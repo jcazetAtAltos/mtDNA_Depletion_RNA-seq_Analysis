@@ -1,0 +1,661 @@
+---
+title: "Gene Clustering Analysis"
+author: "Jack Cazet"
+date: "2/13/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The purpose of this document is first to identify clusters of differentially expressed genes with similar expression profiles across the samples in the data set, then to identify pathways that are significantly enriched in those clusters of co-expressed genes.  
+
+```{r libraries loading, echo=FALSE, warnings = FALSE, message=FALSE}
+library(edgeR)
+library(knitr)
+library(DT)
+library(ggpubr)
+library(ggplot2)
+library(msigdbr)
+library(fgsea)
+library(plotly)
+library(plyr)
+library(viridis)
+library(igraph)
+library(leiden)
+library(htmlwidgets)
+```
+
+First, I load the previously generated DGE results file that contains the differentially expressed genes and normalized counts.
+
+```{r load previous results}
+
+#load DGE results
+load('../DGE/RNA_DGE.RData')
+
+#load functional annotation table (downloaded from uniprot)
+Annotations <- read.delim("../../data/generalResources/hsUpAnnots.tsv", stringsAsFactors = F)
+Annotations$ID <- Annotations$Gene.Names..primary.
+Annotations <- Annotations[!duplicated(Annotations$Gene.Names..primary.),]
+
+```
+
+## PCA
+
+First, I'll use some PCA plots to get a general sense for broad trends in the data. I'm restricting the analysis to the 1000 most variable genes to focus on the most prominent changes in the data. 
+
+### All samples
+
+First, I'll look across all the samples. 
+
+```{r full dataset PCA}
+
+####Sample PCA####
+
+#Calculate standard deviation to identify the most variable genes
+#The goal is to focus on the predominant signal, and filtering out noise or non-variable genes
+normalizedCounts.sd <- apply(normalizedCounts,1,sd)
+normalizedCounts.sd <- normalizedCounts.sd[order(-normalizedCounts.sd)]
+
+#pick the top 1000 most variable genes
+normalizedCounts.sd.top <- normalizedCounts[names(normalizedCounts.sd[1:1000]),]
+
+#PCA on all samples
+pcRes <- prcomp(t(normalizedCounts.sd.top), scale. = T, center = T)
+
+#plot the first two PCs
+pcPlot <- as.data.frame(pcRes$x[,1:2])
+pcPlot$samp <- rownames(pcPlot)
+pcPlot$treat <- gsub('^[^_]_','',pcPlot$samp)
+gg <- ggplot(pcPlot, aes(x=PC1,y=PC2,color=treat, label=samp)) + geom_point()
+ggsave('allSamplePCA_top1000.pdf', gg, width = 7, height = 7)
+
+#this makes the plot interactive, so you can hover over samples and see sample names
+ggplotly()
+```
+
+The first PC clearly separates samples by media condition with the exception of UP_R1_CTRL, which is an outlier that clusters with the D media samples. PC2 somewhat separates recovery-phase ddC-treated samples (they all have comparatively low PC values), but this relationship doesn't hold for D media samples.
+
+### UP media only
+
+To delve into media-specific relationships, I'll redo the PCA on each media treatment separately. First, I'll look at the UP media samples.
+
+```{r UP PCA}
+
+#PCA on UP samples
+normalizedCounts.sd <- apply(normalizedCounts[,grepl('_UP_', colnames(normalizedCounts))],1,sd)
+normalizedCounts.sd <- normalizedCounts.sd[order(-normalizedCounts.sd)]
+
+#pick the top 1000 most variable genes
+normalizedCounts.sd.top <- normalizedCounts[names(normalizedCounts.sd[1:1000]),grepl('_UP_', colnames(normalizedCounts))]
+
+pcRes <- prcomp(t(normalizedCounts.sd.top), scale. = T, center = T)
+
+#plot the first two PCs
+pcPlot <- as.data.frame(pcRes$x[,1:2])
+pcPlot$samp <- rownames(pcPlot)
+pcPlot$treat <- gsub('^[^_]_','',pcPlot$samp)
+gg <- ggplot(pcPlot, aes(x=PC1,y=PC2,color=treat, label=samp)) + geom_point()
+ggsave('upSamplePCA_top1000.pdf', gg, width = 7, height = 7)
+
+#this makes the plot interactive, so you can hover over samples and see sample names
+ggplotly()
+
+```
+
+In this plot PC one appears to isolate out the R3 and R5 ddC samples. PC2 isolates R1 ddC samples (and R1 control samples as well). Biological replicates generally co-cluster, indicating good overall reproducibility.
+
+### D media only
+
+```{r , D PCA}
+
+#PCA on D samples
+normalizedCounts.sd <- apply(normalizedCounts[,grepl('_D_', colnames(normalizedCounts))],1,sd)
+normalizedCounts.sd <- normalizedCounts.sd[order(-normalizedCounts.sd)]
+
+#pick the top 1000 most variable genes
+normalizedCounts.sd.top <- normalizedCounts[names(normalizedCounts.sd[1:1000]),grepl('_D_', colnames(normalizedCounts))]
+
+pcRes <- prcomp(t(normalizedCounts.sd.top), scale. = T, center = T)
+
+#plot the first two PCs
+pcPlot <- as.data.frame(pcRes$x[,1:2])
+pcPlot$samp <- rownames(pcPlot)
+pcPlot$treat <- gsub('^[^_]_','',pcPlot$samp)
+gg <- ggplot(pcPlot, aes(x=PC1,y=PC2,color=treat, label=samp)) + geom_point()
+ggsave('dSamplePCA_top1000.pdf', gg, width = 7, height = 7)
+
+#this makes the plot interactive, so you can hover over samples and see sample names
+ggplotly()
+
+```
+
+For the D media samples, there isn't a clear trend isolating ddC treated from control samples on either axis. PC1 somewhat separates R3 ddC samples and PC2 somewhat separates R5 ddC samples. Biological replicates again largely co-cluster.
+
+Overall, the the PCs don't seem to have a straightforward interpretation and don't clearly highlight the comparisons we're interested in making.
+
+## Clustering differentially expressed genes
+
+In order to focus on trends in the genes that are changing in response to the experimental perturbations, I'll focus the next part of the analysis on only those genes that showed a significant difference in at least one of the pairwise comparisons from the DGE. This helps to exclude genes that are changing because of other confounding factors.
+
+To identify groups of co-expressed genes, I first generate lists of nearest neighbors (NNs) for each gene based on a distance metric derived from correlation scores. I then use these NNs to generate an adjacency matrix that can be used for Leiden clustering.
+
+```{r Leiden clustering, warning=FALSE}
+
+#get list of all genes that were differentially in any of the pairwise comparisons
+difGenes <- lapply(allRes, function(x) x[[2]]$ID)
+difGenes <- unique(unlist(difGenes))
+
+#pull out the normalized counts for differentially expressed genes
+difMat <- normalizedCounts[rownames(normalizedCounts) %in% difGenes,]
+
+#convert expression values to z-scores
+difMat.z <- t(apply(difMat, 1, function(x) (x -mean(x))/sd(x)))
+
+#generate a distance metric based on gene to gene correlation
+#the more correlated the z-scores, the lower the distance metric
+d <- 1-cor(t(difMat.z))
+
+#set number of nearest neighbors
+n <- 15
+
+#get nearest neighbors based on cor distance (excluding self, which will always have distance of 0)
+d.nn <- lapply(1:ncol(d), function(x) {
+  resDF <- data.frame(id=rownames(d),dist=d[,x])
+  resDF <- resDF[order(resDF$dist),]
+  resDF[2:(n+1),'id']
+})
+
+#make sure to propagate gene name labels
+names(d.nn) <- rownames(d)
+
+#make adjacency matrix based on NNs
+#for each gene, every gene that wasn't a NN gets a 0, NNs assigned a value of 1
+aMat <- lapply(1:nrow(difMat), function(x) {
+  #asks which genes are in the list of NNs for a given gene?
+  #converts boolean values into numeric equivalents
+  as.numeric(rownames(difMat) %in% d.nn[[x]])
+})
+
+#collapse into a single data frame
+aMat <- do.call(rbind,aMat)
+rownames(aMat) <- rownames(difMat)
+colnames(aMat) <- rownames(difMat)
+
+#perform leiden clustering on adjacency matrix
+#use a relatively low resolution to try and avoid redundant clusters
+clusts <- invisible(leiden(aMat, seed = 12345, resolution = 0.5))
+
+#convert results to list of cluster assignments for all the genes considered in the analysis
+clusts.names <- data.frame(clust = clusts, name = rownames(difMat))
+
+#save cluster assignments for later
+save(file = "clusterAssignments.Rdata", list = 'clusts.names')
+
+#group genes by cluster assignment
+difMat.clust <- split(difMat, clusts)
+
+table(clusts.names$clust)
+
+```
+
+This clustering generated 6 clusters of genes. 
+
+To visualize the expression profiles associated with each of these six clusters, I then plot all of the individual expression profiles of genes associated with a particular cluster overlayed on top of each other, along with a line representing the average expression profile across all of the genes.
+
+In addition, I also generate scores across all genes considered in the DGE analysis that convey how similar the expression profile of an individual gene is to the average expression profile associated with each cluster. This comes in handy later when performing pathway enrichment analyses. I export these gene scores as CSVs for future reference.
+
+
+```{r Cluster visualization}
+#Visualizing the expression profiles of each cluster
+
+#to allow co-plotting of genes with different absolute expression values,
+#convert normalized counts into z-scores across each gene
+normVals <- as.data.frame(t(apply(normalizedCounts,1,function(y) (y-mean(y))/sd(y))))
+
+#function that calculates the average expression profile for a cluster of interest,
+#calculates a correlation score for all genes relative to that average expression
+#profile, and generates a line plot of genes in the cluster
+#the function returns a gg plot object and a dataframe of gene correlation scores
+aveClPlot <- function(x){
+  
+  #pull out the z-score expression values for genes assigned to a given cluster
+  normVals.col <- t(normVals[rownames(normVals) %in% rownames(x),])
+  
+  #calculate the average z-score across technical replicates for each gene
+  normVals.col <- aggregate(normVals.col,list(gsub('^._','',rownames(normVals.col))),mean)
+  
+  #fix rownames so that they're still gene names
+  rownames(normVals.col) <- normVals.col$Group.1
+  normVals.col <- normVals.col[,-1]
+  
+  #calculate average expression profile across all genes
+  normVals.col <- apply(normVals.col,1,mean)
+  
+  #make dataframe with average expression values and other useful sample attribute columns
+  normVals.col <- data.frame(time = gsub('.*_([^_]+)_.*','\\1',names(normVals.col)),
+                             treat = gsub('.*_','',names(normVals.col)),
+                             media = gsub('_.*','',names(normVals.col)),
+                             exp = normVals.col,
+                             gene = 'merge')
+  
+  #order samples by timepoint
+  normVals.col <- normVals.col[order(normVals.col$treat,normVals.col$time),]
+  
+  
+  
+  #also make equivalent expression/metadata dataframe for individual gene expression profiles
+  #first pull out the z-score values for the cluster genes
+  normVals.plot <- t(normVals[rownames(normVals) %in% rownames(x),])
+  
+  #for each gene, calculate average expression values across technical reps
+  #and store those values in dataframe with sample attributes
+  normVals.plot <- lapply(1:ncol(normVals.plot), function(y){
+    newDF <- data.frame(time = gsub('^._[^_]+_([^_]+)_.*','\\1',rownames(normVals.plot)), 
+                        treat = gsub('.*_','',rownames(normVals.plot)),
+                        media = gsub('^._([^_]+)_.*','\\1',rownames(normVals.plot)),
+                        exp = normVals.plot[,y])
+    
+    newDF <- aggregate(newDF$exp,list(newDF$time,newDF$treat,newDF$media),mean)
+    
+    colnames(newDF) <- c('time','treat','media','exp')
+    newDF$gene <- rownames(x)[y]
+    
+    return(newDF)
+  })
+  
+  #collapse individual gene results into a single dataframe
+  normVals.plot <- do.call(rbind,normVals.plot)
+  
+  #although all genes are assigned a cluster, not all genes closely match the 
+  #average expression profile of the cluster as a whole, below I'm calculating a 
+  #correlation score for each gene that quantifies how similar the expression 
+  #values of the individual gene are to the cluster average expression profile
+  geneComp <- lapply(rownames(normVals), function(y){
+    
+    #get the expression for the gene of interest (averaged across tech reps)
+    indG <- as.data.frame(t(normVals[y,]))
+    indG$samp <- gsub('^._','',rownames(indG))
+    indG <- aggregate(indG[,1],list(indG[,2]),mean)
+    rownames(indG) <- indG$Group.1
+    
+    #make sure sample order here matches the sample order in the vector of 
+    #average cluster expression values
+    indG <- indG[rownames(normVals.col),]
+    
+    indG <- indG[,2]
+    
+    #pull the average expression profile for the cluster as a whole
+    aveG <- normVals.col$exp
+    
+    #calculate similarity
+    cor(aveG,indG)
+  })
+  
+  #reformat correlation scores into dataframe
+  geneComp <- data.frame(gene = rownames(normalizedCounts), cor = unlist(geneComp))
+  
+  #reorder genes so that the genes most similar to the cluster average appear
+  #at the top
+  geneComp <- geneComp[order(-geneComp$cor),]
+  
+  #add some functional annotation information to the correlation scores for context
+  geneComp <- merge(geneComp,Annotations,by.x = 'gene',by.y='ID',all.x=T)
+  
+  #for plotting, just use the cluster genes that have particularly high correlation values
+  normVals.plot <- normVals.plot[normVals.plot$gene %in% geneComp[geneComp$cor > 0.8, 'gene'],]
+  
+  #make line plot of each individual gene across the different timepoints/treatments
+  #highlight the average expression profile in red
+  gg <- ggplot(normVals.plot, aes(x=time,y=exp,group=gene)) + 
+    geom_line(alpha=0.2) + 
+    geom_line(data = normVals.col, aes(x=time,y=exp), color='red', linewidth = 1.5) +
+    theme_bw() + 
+    facet_wrap(media~treat)
+  
+  #print(gg)
+  
+  #return both the average expression plot and the gene correlation scores
+  return(list(gg,geneComp))
+  
+}
+
+#run the above function on each set of gene clusters
+clRes <- lapply(1:max(clusts),function(x) aveClPlot(difMat.clust[[x]]))
+
+#pull out just the plot objects
+clRes.plots <- lapply(clRes, function(x) x[[1]])
+
+#pull out just the correlation score tables
+clRes.genes <- lapply(clRes, function(x) x[[2]])
+
+#save cluster gene correlation tables as csv files
+invisible(lapply(1:length(clRes.genes), function(x) write.csv(clRes.genes[[x]], file = paste0('cluster',x,'_GeneScores.csv'))))
+
+```
+
+Below I visualize the expression profiles associated with each cluster.
+
+```{r, fig.width=6, fig.height=6 , echo=FALSE}
+#display all the cluster plots side by side
+ggarrange(plotlist = clRes.plots, labels = 1:length(clRes.plots))
+ggsave(file = 'bulkRnaClust.pdf',width = 15,height=12)
+
+```
+
+Of the six clusters, the 3 that seem most interesting are 1, 4, and 6. 1 appears to consist of genes that are activated during the recovery stage, 4 appears to be genes that are repressed during the recovery stage, and 6 closely tracks with mtDNA depletion kinetics. 
+
+Consistently, cluster 6 largely consists of mitochondrial genes.
+
+```{r cluster 6 gene names}
+
+rownames(difMat.clust[[6]])
+
+```
+
+
+## Pathway analysis of gene clusters
+
+To try and identify biological processes associated with the different gene co-expression clusters, I perform gene set enrichment analysis using the gene cluster scores I generated above. For gene sets, I use mSigDB. The results tables are then exported to CSVs after a adjusted p-value cutoff of 0.01 is applied to exclude non-significant pathways.
+
+```{r Cluster GSEA}
+
+#use MSigDB as source for gene sets
+all_gene_sets <- msigdbr(species = "Homo sapiens")
+
+#just focus on 
+all_gene_sets.col <- all_gene_sets[all_gene_sets$gs_cat %in% c('H','C2','C3','C5'),]
+
+#ignore miRNA gene sets (there's a lot of them and they clutter up the results)
+all_gene_sets.col <- all_gene_sets.col[!grepl('^MIR',all_gene_sets.col$gs_subcat),]
+
+#group genes by gene set
+all_gene_sets.col <- split(all_gene_sets.col,all_gene_sets.col$gs_name)
+all_gene_sets.col <- lapply(all_gene_sets.col, function(x) x$gene_symbol)
+
+#load ID conversion table 
+#(lets you interconvert between various gene names from different databases)
+gConTab <- read.delim('../../data/generalResources/ens_gID_to_symbol.txt')
+gConTab <- gConTab[!duplicated(gConTab$ensembl_gene_id),]
+gConTab <- gConTab[gConTab$hgnc_symbol != '',]
+
+#loop through each set of cluster gene scores and perform GSEA across all the
+#MSigDB gene sets
+gseaRes <- lapply(1:length(clRes.genes), function(x){
+  
+  #use correlation scores to rank genes according to how similar they are to the
+  #average cluster expression profile
+  geneRanks <- clRes.genes[[x]]$cor
+  names(geneRanks) <- clRes.genes[[x]]$gene
+  
+  #only perform the enrichment on genes that significantly change (optional)
+  geneRanks <- geneRanks[names(geneRanks) %in% difGenes]
+  
+  #try to catch some of the ensembl gene IDs that didn't get a symbol and
+  #fix the ID
+  names(geneRanks) <- mapvalues(names(geneRanks), from = gConTab$ensembl_gene_id, to = gConTab$hgnc_symbol, warn_missing = F)
+  
+  pathways <- all_gene_sets.col
+  
+  #run the GSEA
+  fgseaRes <- fgsea(pathways, geneRanks, maxSize = 500, minSize = 10)
+  
+  #drop non-significant results
+  fgseaRes <- fgseaRes[fgseaRes$padj <= 0.01,]
+  
+  #order results by enrichment score (most strongly enriched on top)
+  fgseaRes <- fgseaRes[order(-fgseaRes$NES),]
+  
+  #reformat the leading edge vector to be more accessible
+  leadingEdgeVect <- vapply(1:nrow(fgseaRes), function(y){
+    oldVec <- fgseaRes[y,8]
+    oldVec <- oldVec[[1]][[1]]
+    #oldVec <- unique(mapvalues(oldVec, from = gConTab$entrezgene_id, to = gConTab$hgnc_symbol, warn_missing = F))
+    
+    oldVec <- paste(oldVec, collapse = '; ')   
+    
+    return(oldVec)
+  }, character(1))
+  fgseaRes$leadingEdge <- leadingEdgeVect
+  
+  return(fgseaRes)
+  
+})
+
+#save cluster enrichment results as CSVs
+invisible(lapply(1:length(gseaRes), function(x) {
+  write.csv(gseaRes[[x]], file = paste0('clust',x,'_gsea.csv'))
+}))
+
+
+```
+
+### Grouping enriched pathways composed of similar gene sets
+
+Because gene set databases are often made up of thousands of gene sets, enrichment results can often be overwhelming and somewhat hard to interpret. However, in many cases, many of the enriched pathways will be driven by the same set of underlying genes, leading to redundancy that is not immediately obvious when looking at the pathway names alone.
+
+To try and discern general themes from the pathway enrichment results, I generate a network graph based on the number of shared leading edge genes among different enriched pathways. This approach groups together pathways that have a high degree of overlap in their leading edge genes, highlighting general trends and redundancies. These plots are interactive, allowing you to hover your mouse over a particular pathway to see it's name and the top 10 leading edge genes. You can also double click on cluster names in the figure legend on the right to display only the pathways belonging to that cluster. These plots are also saved as HTML files for future reference. Note that I divide the pathways into those that were enriched (i.e., positive enrichment scores) or depleted (i.e., negative enrichment scores) in each cluster.
+
+```{r Pathway clustering, warning = FALSE, message=FALSE}
+
+unlink('pathwayClusters', recursive = T)
+dir.create('pathwayClusters', showWarnings = F)
+
+clustPaths <- function(x) {
+  #pull enrichment results
+  resGraph <- x
+  
+  #generate a dataframe of all possible pairs of pathways (excluding self pairs)
+  resGraph.edge <- expand.grid(resGraph$pathway,resGraph$pathway)
+  resGraph.edge <- resGraph.edge[resGraph.edge$Var1 != resGraph.edge$Var2,]
+  
+  #for each combination, ask what percentage of genes in the first
+  #pathway leading edge gene list are also found in the second pathway
+  resGraph.edge$weight <- vapply(1:nrow(resGraph.edge), function(x) {
+    side1.genes <- as.character(resGraph[resGraph$pathway == resGraph.edge[x,1],'leadingEdge'])
+    side1.genes <- strsplit(side1.genes, '; ')[[1]]
+    
+    side2.genes <- as.character(resGraph[resGraph$pathway == resGraph.edge[x,2],'leadingEdge'])
+    side2.genes <- strsplit(side2.genes, '; ')[[1]]
+    
+    olapL <- length(intersect(side1.genes, side2.genes))
+    totL <- length(side1.genes)
+    return(olapL/totL)
+    
+  }, numeric(1))
+  
+  colnames(resGraph.edge) <- c('from','to','weight')
+  
+  #drop vertices with weight = 0
+  resGraph.edge <- resGraph.edge[resGraph.edge$weight > 0.1,]
+  
+  #generate igraph object from vertices/weights
+  g <- graph.data.frame(resGraph.edge)
+  
+  #cluster pathways based on random walks
+  g.cl <- cluster_walktrap(g, steps = 4, weights = E(g)$weight)
+  
+  set.seed(1234)
+  #save graph coordinates for plotting with ggplot/plotly
+  g.plot <- as.data.frame(layout_with_fr(g))
+  
+  colnames(g.plot) <- c('x','y')
+  
+  g.plot$pathway <- V(g)$name
+  
+  g.plot$clust <- as.factor(g.cl$membership)
+  
+  g.plot$sigScore <- as.numeric(mapvalues(g.plot$pathway, 
+                                          from = resGraph$pathway, 
+                                          to = resGraph$padj,
+                                          warn_missing = F))
+  
+  g.plot$sigScore <- -log10(g.plot$sigScore)
+  
+  #for each cluster, display the top 10 leading edge genes
+  g.plot$topGenes <- mapvalues(g.plot$pathway, 
+                               from = resGraph$pathway, 
+                               to = resGraph$leadingEdge, 
+                               warn_missing = F)
+  
+  g.plot$topGenes <- vapply(g.plot$topGenes, function(x) {
+    subGenes <- strsplit(x,'; ')[[1]]
+    subGenes <- paste(subGenes[1:min(c(length(subGenes),10))], collapse = '; ')
+    return(subGenes)
+  }, '')
+  
+  gg <- ggplot(g.plot, aes(x=x,y=y,label=pathway, color = clust, 
+                           topGenes = topGenes, size = sigScore)) + 
+    geom_point(aes(label=pathway, fill = clust,topGenes = topGenes, size = sigScore), 
+               colour="black",pch=21)
+  
+  ggpl <- ggplotly(gg)
+  return(ggpl)
+}
+
+#run the pathway clustering across all gsea results, splitting the clustering
+#into sets with positive or negative enrichment scores
+pathClusters <- invisible(lapply(1:length(gseaRes), function(x) {
+  
+  clustP.up <- gseaRes[[x]]
+  clustP.up <- clustP.up[clustP.up$NES > 0,]
+  
+  clustP.down <- gseaRes[[x]]
+  clustP.down <- clustP.down[clustP.down$NES < 0,]
+  
+  if(nrow(clustP.up) > 0){
+    clustP.up <- invisible(clustPaths(clustP.up))
+    saveWidget(clustP.up, paste0('pathwayClusters/pathway_clusters_clust',x,'_PosEnrichmentScore.html'))
+  }
+  
+  if(nrow(clustP.down) > 0){
+    clustP.down <- invisible(clustPaths(clustP.down))
+    saveWidget(clustP.down, paste0('pathwayClusters/pathway_clusters_clust',x,'_NegEnrichmentScore.html'))
+  }
+  
+  return(list(clustP.up,clustP.down))
+  
+}))
+
+```
+
+### Cluster 1
+
+#### Positive enrichment scores
+
+```{r, echo=FALSE}
+#positive scores
+pathClusters[[1]][[1]]
+
+```
+
+#### Negative enrichment scores
+```{r, echo=FALSE}
+#negative scores
+pathClusters[[1]][[2]]
+
+```
+
+### Cluster 2
+
+#### Positive enrichment scores
+
+```{r, echo=FALSE}
+
+#positive scores
+pathClusters[[2]][[1]]
+
+```
+
+#### Negative enrichment scores
+
+```{r, echo=FALSE}
+#negative scores
+pathClusters[[2]][[2]]
+
+```
+
+### Cluster 3
+
+#### Positive enrichment scores
+
+```{r, echo=FALSE}
+
+#positive scores
+pathClusters[[3]][[1]]
+
+```
+
+#### Negative enrichment scores
+
+```{r, echo=FALSE}
+#negative scores
+pathClusters[[3]][[2]]
+
+```
+
+### Cluster 4
+
+#### Positive enrichment scores
+
+```{r, echo=FALSE}
+
+#positive scores
+pathClusters[[4]][[1]]
+
+```
+
+#### Negative enrichment scores
+
+```{r, echo=FALSE}
+
+#negative scores
+pathClusters[[4]][[2]]
+
+```
+
+### Cluster 5
+
+#### Positive enrichment scores
+
+```{r, echo=FALSE}
+
+#positive scores
+pathClusters[[5]][[1]]
+```
+
+#### Negative enrichment scores
+
+```{r, echo=FALSE}
+#negative scores
+pathClusters[[5]][[2]]
+
+```
+
+### Cluster 6
+
+#### Positive enrichment scores
+
+```{r, echo=FALSE}
+
+#positive scores
+pathClusters[[6]][[1]]
+```
+
+#### Negative enrichment scores
+
+```{r, echo=FALSE}
+#negative scores
+pathClusters[[6]][[2]]
+
+```
+
+
+
+
+
+
+
+
+

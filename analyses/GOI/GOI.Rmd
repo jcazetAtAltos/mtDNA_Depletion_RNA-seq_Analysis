@@ -1,0 +1,418 @@
+---
+title: "Plotting genes of interest"
+author: "Jack Cazet"
+date: "2/14/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries loading, echo=FALSE, warnings = FALSE, message=FALSE}
+
+library(edgeR)
+library(knitr)
+library(DT)
+library(ggpubr)
+library(ggplot2)
+library(plyr)
+library(viridis)
+library(gplots)
+
+```
+
+
+```{r load previous results}
+
+#load DGE results
+load('../DGE/RNA_DGE.RData')
+
+#load functional annotation table (downloaded from uniprot)
+Annotations <- read.delim("../../data/generalResources/hsUpAnnots.tsv", stringsAsFactors = F)
+Annotations$ID <- Annotations$Gene.Names..primary.
+Annotations <- Annotations[!duplicated(Annotations$Gene.Names..primary.),]
+
+
+load("../clusteringAnalysis/clusterAssignments.Rdata")
+```
+
+## Plotting individual genes of interest
+
+In the chunk below, I create a function that allows for generating an RNA expression plot for any individual gene of interest. These plots separate samples by treatment and media condition and display asterisks above those timepoints where the ddC treated samples were significantly different from the controls. The gene symbol in the example plot below can be swapped out for any gene that was included in the DGE analysis.
+
+```{r Plotting individual genes}
+
+#generate significance matrix for all pairwise comparisons between control and treated timepoints
+#this will serve as the reference for whether or not a gene was significantly different
+#for a given pairwise comparison
+
+#first initialize an empty matrix of the appropriate size
+sigMat <- matrix(F,nrow(analysisList$counts),length(unique(gsub('_[^_]+$','',analysisList$samples$group))))
+rownames(sigMat) <- rownames(analysisList$counts)
+colnames(sigMat) <- unique(gsub('_[^_]+$','',analysisList$samples$group))
+
+#loop through each row and gene and check if it is differentially expressed
+for(i in 1:nrow(sigMat)){
+  for(j in 1:ncol(sigMat)){
+    checkVal <- allRes[[colnames(sigMat)[j]]]
+    checkVal <- checkVal[[2]]
+    checkVal <- checkVal$ID
+    sigMat[i,j] <- rownames(sigMat)[i] %in% checkVal
+  }
+}
+
+#function to generate line plots with expression values for individual genes
+#across all the samples in the dataset (split by treatment)
+gPlot <- function(x,sigMat,normalizedCounts){
+  difVals <- data.frame(samp = colnames(normalizedCounts), exp = as.numeric(normalizedCounts[x,]))
+  difVals$treat <- gsub('.*_(.+)$','\\1',difVals$samp)
+  difVals$time <- gsub('.*_(..)_[^_]+$','\\1',difVals$samp)
+  difVals$media <- gsub('^._([^_]+).*','\\1',difVals$samp)
+  difVals.collapse <- aggregate(difVals[,2],by = list(difVals$treat,difVals$time,difVals$media),mean)
+  difVals.collapse$Group.2 <- factor(difVals.collapse$Group.2)
+  difVals$time <- factor(difVals$time)
+  
+  colnames(difVals.collapse) <- c('treat','time','media','exp')
+  
+  sigVals <- difVals.collapse[order(-difVals.collapse$exp),]
+  sigVals <- sigVals[!duplicated(paste(sigVals$time,sigVals$media)),]
+  rownames(sigVals) <- paste(sigVals$media,sigVals$time, sep = '_')
+  sigVals <- sigVals[colnames(sigMat),]
+  sigVals$sig <- sigMat[x,]
+  sigVals[sigVals$sig,'sig'] <- '*'
+  sigVals[sigVals$sig== 'FALSE','sig'] <- ''
+  colnames(sigVals) <- c('treat','time','media','exp','sig')
+  
+  gg <- ggplot(difVals.collapse, aes(x=time,y=exp,color=treat,group=treat)) + geom_line()
+  gg <- gg + geom_point(data = difVals, aes(x=time,y=exp,color=treat,group=treat))
+  gg <- gg + geom_text(data=sigVals, aes(x=time, y=exp+0.2,label=sig), size=12, color='black')
+  gg <- gg + theme_bw() + facet_wrap(.~media)
+  return(gg)
+}
+
+#example of individual gene plot
+gPlot('XBP1',sigMat,normalizedCounts)
+
+```
+
+## Heatmaps for gene sets of interest
+
+Note that each heatmap is generated twice using two different color palettes. This is to allow for combining separate parts from the two heatmaps into a single figure after the fact. This is a workaround to correct for the fact that I'm unable to give different treatment groups different color palettes within the same plot.
+
+### ATF4-linked genes
+
+The chunk below plots genes that were upregulated following mtDNA depletion in a previous study ([Bao et al., 2016](https://elifesciences.org/articles/10575)) and that contained a predicted ATF4 binding site in their presumptive promoter region. These heatmaps are also saved as PDFs
+
+```{r ATF4 heatmap, fig.width=10}
+
+#look at genes linked to ATF4 from previous study (bao 2016)
+atf4.targ <- read.csv('../../data/generalResources/bao2016_topUp.csv')
+
+#only include those upregulated genes with a predicted ATF4 binding site in the 
+#presumptive promoter region
+atf4.targ <- atf4.targ[atf4.targ$ATF4.site.sequence != '',]
+
+#subset readcounts to just include targets
+atf4.targ.ct <- normalizedCounts[atf4.targ[,1],]
+atf4.targ.ct <- atf4.targ.ct[complete.cases(atf4.targ.ct),]
+
+#convert to z-scores (by gene)
+atf4.targ.ct <- t(apply(atf4.targ.ct, 1, function(x) (x - mean(x))/sd(x)))
+
+#reorder columns
+atf4.targ.ct <- atf4.targ.ct[,order(gsub('^._([^_]+).*','\\1',colnames(atf4.targ.ct)),
+                                    gsub('.*_([^_]+)$','\\1',colnames(atf4.targ.ct)),
+                                    gsub('.*_([^_]+)_[^_]+$','\\1',colnames(atf4.targ.ct)))]
+
+#optionally remove genes that don't change significantly
+#atf4.targ.ct <- atf4.targ.ct[rownames(atf4.targ.ct) %in% clusts.names$name,]
+
+#plot in heatmap
+heatmap.2(atf4.targ.ct,
+          Colv = F,
+          Rowv = T,
+          scale = 'none',
+          dendrogram = 'none',
+          col = magma(30),
+          trace='none',
+          key = F,
+          colsep = seq(3,60,3),
+          keysize = 0.1,
+          margins = c(5,6),
+          cexRow = 1,
+          cexCol = 0.5,
+          distfun = function(x) as.dist(1-cor(t(x))),
+          hclustfun = function(x) hclust(x, method="average"))
+
+
+```
+The heatmap indicates that these putative ATF4 targets are upregulated during the recovery phase following mtDNA depletion.
+
+Checking the cluster assignments for these genes, they are almost uniformly assigned to cluster 1. This demonstrates that they are co-expressed in a similar manner following mtDNA depletion.
+
+```{r ATF4 cluster count}
+
+#check which clusters contain the putative ATF4 targets
+table(clusts.names[clusts.names$name %in% atf4.targ$Symbol,'clust'])
+
+```
+
+
+Below I export the heatmaps as PDFs.
+
+```{r PDF export of ATF4 heatmaps, echo=F}
+pdf('atf4Heat_red.pdf',width = 10, height = 15)
+heatmap.2(atf4.targ.ct,
+          Colv = F,
+          Rowv = T,
+          scale = 'none',
+          dendrogram = 'none',
+          col = magma(30),
+          trace='none',
+          key = F,
+          colsep = seq(3,60,3),
+          keysize = 0.1,
+          margins = c(4,6),
+          cexRow = 1,
+          cexCol = 0.5,
+          distfun = function(x) as.dist(1-cor(t(x))),
+          hclustfun = function(x) hclust(x, method="average"))
+dev.off()
+
+#also plot in green to make a combined color figure
+pdf('atf4Heat_green.pdf',width = 10, height = 15)
+heatmap.2(atf4.targ.ct,
+          Colv = F,
+          Rowv = T,
+          scale = 'none',
+          dendrogram = 'none',
+          col = viridis(30),
+          trace='none',
+          key = F,
+          colsep = seq(3,60,3),
+          keysize = 0.1,
+          margins = c(4,6),
+          cexRow = 1,
+          cexCol = 0.5,
+          distfun = function(x) as.dist(1-cor(t(x))),
+          hclustfun = function(x) hclust(x, method="average"))
+dev.off()
+
+
+```
+
+
+### Mitochondrial genome-encoded genes
+
+The next chunk plots all genes encoded by the mitochondrial genome.
+
+```{r Mito genes, fig.width=10}
+
+#also do mt genome genes
+mt.targ.ct <- normalizedCounts[grepl('^MT-',rownames(normalizedCounts)),]
+mt.targ.ct <- mt.targ.ct[complete.cases(mt.targ.ct),]
+
+#convert to z-scores (by gene)
+mt.targ.ct <- t(apply(mt.targ.ct, 1, function(x) (x - mean(x))/sd(x)))
+
+#reorder columns
+mt.targ.ct <- mt.targ.ct[,order(gsub('^._([^_]+).*','\\1',colnames(mt.targ.ct)),
+                                gsub('.*_([^_]+)$','\\1',colnames(mt.targ.ct)),
+                                gsub('.*_([^_]+)_[^_]+$','\\1',colnames(mt.targ.ct)))]
+
+#optionally remove genes that don't change significantly
+#mt.targ.ct <- mt.targ.ct[rownames(mt.targ.ct) %in% clusts.names$name,]
+
+heatmap.2(mt.targ.ct,
+          Colv = F,
+          Rowv = T,
+          scale = 'none',
+          dendrogram = 'none',
+          col = magma(30),
+          trace='none',
+          key = F,
+          colsep = seq(3,60,3),
+          keysize = 0.1,
+          margins = c(5,6),
+          cexRow = 1,
+          cexCol = 0.5,
+          distfun = function(x) as.dist(1-cor(t(x))),
+          hclustfun = function(x) hclust(x, method="average"))
+
+```
+
+Notably, the mitochondrially encoded genes appear to recover more quickly in the UP media samples than in the D media samples.
+
+
+
+Below I export the plot as a PDF
+
+```{r Mito genes PDF export}
+
+#plot in heatmap
+pdf('mtHeat_red.pdf',width = 4, height = 5)
+heatmap.2(mt.targ.ct,
+          Colv = F,
+          Rowv = T,
+          scale = 'none',
+          dendrogram = 'none',
+          col = magma(30),
+          trace='none',
+          key = F,
+          colsep = seq(3,60,3),
+          keysize = 0.1,
+          margins = c(4,6),
+          cexRow = 1,
+          cexCol = 0.5,
+          distfun = function(x) as.dist(1-cor(t(x))),
+          hclustfun = function(x) hclust(x, method="average"))
+dev.off()
+
+pdf('mtHeat_green.pdf',width = 4, height = 5)
+heatmap.2(mt.targ.ct,
+          Colv = F,
+          Rowv = T,
+          scale = 'none',
+          dendrogram = 'none',
+          col = viridis(30),
+          trace='none',
+          key = F,
+          colsep = seq(3,60,3),
+          keysize = 0.1,
+          margins = c(4,6),
+          cexRow = 1,
+          cexCol = 0.5,
+          distfun = function(x) as.dist(1-cor(t(x))),
+          hclustfun = function(x) hclust(x, method="average"))
+dev.off()
+
+```
+
+### Interferon stimulated genes
+
+In the chunk below, I generate a heatmap of interferon stimulated genes (ISGs) that were reported to be inhibited by mtDNA depletion in YME1L-deficient cells [Spregner et al., 2021](https://www.nature.com/articles/s42255-021-00385-9).
+
+```{r ISG heatmaps, fig.width=10}
+
+#also do inflammation genes
+
+#read in gene list from Spregner et al., 2021
+inList <- read.delim('../../data/generalResources/mouseInflameList.txt',header = F)[,1]
+
+#read in human to mouse ortholog map
+m2hOrtho <- read.delim('../../data/generalResources/HOM_MouseHumanSequence.rpt')
+
+#need to split by gene because of the ass-backwards way the table's formatted
+gName <- ''
+sharedGeneRes <- character(nrow(m2hOrtho))
+
+for(i in 1:nrow(m2hOrtho)){
+  if(m2hOrtho$NCBI.Taxon.ID[i] == 10090){
+    gName <- m2hOrtho$Symbol[i]
+  }
+  sharedGeneRes[i] <- gName
+}
+
+m2hOrtho$sharedGene <- sharedGeneRes
+
+m2hOrtho <- split(m2hOrtho, m2hOrtho$sharedGene)
+
+names(m2hOrtho) <- sapply(m2hOrtho, function(x) x$sharedGene[1])
+
+#subset to just include the genes in the inflam list
+
+m2hOrtho.inflam <- unlist(sapply(inList, function(x) {
+  which(grepl(paste0('^',x,'$'), names(m2hOrtho), ignore.case = F))
+}))
+
+m2hOrtho.inflam <- m2hOrtho[m2hOrtho.inflam]
+
+m2hOrtho.inflam <- do.call(rbind, m2hOrtho.inflam)
+
+m2hOrtho.inflam <- m2hOrtho.inflam[m2hOrtho.inflam$NCBI.Taxon.ID != 10090,]
+
+m2hOrtho.inflam <- m2hOrtho.inflam[!duplicated(m2hOrtho.inflam$Symbol),]
+
+inf.targ.ct <- normalizedCounts[rownames(normalizedCounts) %in% m2hOrtho.inflam$Symbol,]
+
+#convert to z-scores (by gene)
+inf.targ.ct <- t(apply(inf.targ.ct, 1, function(x) (x - mean(x))/sd(x)))
+
+#reorder columns
+inf.targ.ct <- inf.targ.ct[,order(gsub('^._([^_]+).*','\\1',colnames(inf.targ.ct)),
+                                gsub('.*_([^_]+)$','\\1',colnames(inf.targ.ct)),
+                                gsub('.*_([^_]+)_[^_]+$','\\1',colnames(inf.targ.ct)))]
+
+heatmap.2(inf.targ.ct,
+          Colv = F,
+          Rowv = T,
+          scale = 'none',
+          dendrogram = 'none',
+          col = magma(30),
+          trace='none',
+          key = F,
+          colsep = seq(3,60,3),
+          keysize = 0.1,
+          margins = c(5,6),
+          cexRow = 1,
+          cexCol = 0.5,
+          distfun = function(x) as.dist(1-cor(t(x))),
+          hclustfun = function(x) hclust(x, method="average"))
+
+```
+I don't see a clear trend in the expression dynamics of these genes. 
+
+Checking these against the cluster assignments, most were not assigned a cluster, indicating they were not differentially expressed in any of the pairwise comparisons. For genes that were assigned a cluster, there isn't a strong bias towards any particular cluster. The cluster with the highest number of genes is 4, which contains genes that are generally downregulated during the recovery phase.
+
+```{r ISC cluster count}
+
+#check which clusters contain the putative ATF4 targets
+table(clusts.names[clusts.names$name %in% rownames(inf.targ.ct),'clust'])
+
+```
+
+Below I export the plot as a PDF
+
+```{r PDF export for ISG heatmaps}
+
+#plot in heatmap
+pdf('infHeat_red.pdf',width = 4, height = 5)
+heatmap.2(inf.targ.ct,
+          Colv = F,
+          Rowv = T,
+          scale = 'none',
+          dendrogram = 'none',
+          col = magma(30),
+          trace='none',
+          key = F,
+          colsep = seq(3,60,3),
+          keysize = 0.1,
+          margins = c(4,6),
+          cexRow = 1,
+          cexCol = 0.5,
+          distfun = function(x) as.dist(1-cor(t(x))),
+          hclustfun = function(x) hclust(x, method="average"))
+dev.off()
+
+pdf('infHeat_green.pdf',width = 4, height = 5)
+heatmap.2(inf.targ.ct,
+          Colv = F,
+          Rowv = T,
+          scale = 'none',
+          dendrogram = 'none',
+          col = viridis(30),
+          trace='none',
+          key = F,
+          colsep = seq(3,60,3),
+          keysize = 0.1,
+          margins = c(4,6),
+          cexRow = 1,
+          cexCol = 0.5,
+          distfun = function(x) as.dist(1-cor(t(x))),
+          hclustfun = function(x) hclust(x, method="average"))
+dev.off()
+
+
+```
+
