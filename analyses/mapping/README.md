@@ -132,7 +132,7 @@ Note that the one atypical aspect of the data processing is the inclusion of the
 
 There was also a very strong sequence bias in this region:
 
-![baseBiasPosition](../../data/mapping/Desktop/baseBiasPosition.png)
+![baseBiasPosition](../../data/mapping/baseBiasPosition.png)
 
 Because the reads are more than long enough to allow for unique mapping, I simply dropped the first 12 basecalls of all reads to remove these low quality stretches. You can find all the FastQC reports in the `fastqc` directory. The `pre` folders contain the untrimmed reports, and the `post` contains the post-trimming reports.
 
